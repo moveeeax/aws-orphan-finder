@@ -1,0 +1,94 @@
+{
+  "findings": [
+    {
+      "region": "eu-west-1",
+      "kind": "eip",
+      "resource_id": "eipalloc-0a1b",
+      "monthly_cost": 3.83,
+      "reason": "Elastic IP not associated with any instance or interface",
+      "detail": {
+        "public_ip": "52.10.1.2"
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "ebs_volume",
+      "resource_id": "vol-0abc",
+      "monthly_cost": 16.8,
+      "reason": "EBS volume is available (not attached to any instance)",
+      "detail": {
+        "size_gb": 200,
+        "volume_type": "gp3",
+        "age_days": 120,
+        "name": "leftover-data"
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "eni",
+      "resource_id": "eni-0aa",
+      "monthly_cost": 0.0,
+      "reason": "Network interface is detached (available)",
+      "detail": {
+        "description": "",
+        "subnet_id": "subnet-1"
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "snapshot",
+      "resource_id": "snap-0xy",
+      "monthly_cost": 10.5,
+      "reason": "EBS snapshot retained for 400 days",
+      "detail": {
+        "size_gb": 200,
+        "age_days": 400,
+        "description": ""
+      }
+    },
+    {
+      "region": "us-east-1",
+      "kind": "ebs_volume",
+      "resource_id": "vol-0def",
+      "monthly_cost": 5.0,
+      "reason": "EBS volume is available (not attached to any instance)",
+      "detail": {
+        "size_gb": 50,
+        "volume_type": "gp2",
+        "age_days": 60
+      }
+    }
+  ],
+  "summary": {
+    "total_findings": 5,
+    "total_monthly_cost": 36.13,
+    "by_region": {
+      "eu-west-1": {
+        "count": 4,
+        "monthly_cost": 31.13
+      },
+      "us-east-1": {
+        "count": 1,
+        "monthly_cost": 5.0
+      }
+    },
+    "by_kind": {
+      "eip": {
+        "count": 1,
+        "monthly_cost": 3.83
+      },
+      "ebs_volume": {
+        "count": 2,
+        "monthly_cost": 21.8
+      },
+      "eni": {
+        "count": 1,
+        "monthly_cost": 0.0
+      },
+      "snapshot": {
+        "count": 1,
+        "monthly_cost": 10.5
+      }
+    }
+  }
+}
