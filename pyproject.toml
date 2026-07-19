@@ -27,8 +27,8 @@ dependencies = [
 dev = ["pytest>=7.0"]
 
 [project.urls]
-Homepage = "https://github.com/cybercapybara/aws-orphan-finder"
-Repository = "https://github.com/cybercapybara/aws-orphan-finder"
+Homepage = "https://github.com/moveeeax/aws-orphan-finder"
+Repository = "https://github.com/moveeeax/aws-orphan-finder"
 
 [project.scripts]
 aws-orphan-finder = "aws_orphan_finder.cli:main"

@@ -1,6 +1,6 @@
 # aws-orphan-finder
 
-[![CI](https://github.com/cybercapybara/aws-orphan-finder/actions/workflows/ci.yml/badge.svg)](https://github.com/cybercapybara/aws-orphan-finder/actions/workflows/ci.yml)
+[![CI](https://github.com/moveeeax/aws-orphan-finder/actions/workflows/ci.yml/badge.svg)](https://github.com/moveeeax/aws-orphan-finder/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -31,7 +31,7 @@ pip install aws-orphan-finder
 Or from source:
 
 ```bash
-git clone https://github.com/cybercapybara/aws-orphan-finder.git
+git clone https://github.com/moveeeax/aws-orphan-finder.git
 cd aws-orphan-finder
 pip install -e ".[dev]"
 ```
