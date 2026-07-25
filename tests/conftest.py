@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import pytest
+from botocore.exceptions import ClientError
 
 
 class FakeEC2:
@@ -19,27 +20,46 @@ class FakeEC2:
         volumes: List[Dict[str, Any]] = None,
         enis: List[Dict[str, Any]] = None,
         snapshots: List[Dict[str, Any]] = None,
+        images: List[Dict[str, Any]] = None,
+        fail: Dict[str, str] = None,
     ):
         self.addresses = addresses or []
         self.volumes = volumes or []
         self.enis = enis or []
         self.snapshots = snapshots or []
+        self.images = images or []
+        # Map of describe_* method name -> AWS error code to raise, so tests
+        # can prove a failed call never degrades into an empty result.
+        self.fail = fail or {}
         self.mutating_calls: List[str] = []
 
     # --- read-only describe calls -------------------------------------
     def describe_addresses(self, **kwargs):
+        self._maybe_fail("describe_addresses", "DescribeAddresses")
         return {"Addresses": self.addresses}
 
     def describe_volumes(self, **kwargs):
+        self._maybe_fail("describe_volumes", "DescribeVolumes")
         return self._paged("Volumes", self._filter(self.volumes, kwargs, "State"), kwargs)
 
     def describe_network_interfaces(self, **kwargs):
+        self._maybe_fail("describe_network_interfaces", "DescribeNetworkInterfaces")
         return self._paged(
             "NetworkInterfaces", self._filter(self.enis, kwargs, "Status"), kwargs
         )
 
     def describe_snapshots(self, **kwargs):
+        self._maybe_fail("describe_snapshots", "DescribeSnapshots")
         return self._paged("Snapshots", self.snapshots, kwargs)
+
+    def describe_images(self, **kwargs):
+        self._maybe_fail("describe_images", "DescribeImages")
+        return self._paged("Images", self.images, kwargs)
+
+    def _maybe_fail(self, method: str, operation: str):
+        code = self.fail.get(method)
+        if code:
+            raise ClientError({"Error": {"Code": code, "Message": f"{code} on {operation}"}}, operation)
 
     # --- any mutating call should never be invoked --------------------
     def __getattr__(self, name):

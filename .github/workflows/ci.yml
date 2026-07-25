@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.12"]
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -32,3 +32,23 @@ jobs:
         run: |
           aws-orphan-finder --version
           python examples/demo.py json > /dev/null
+
+      - name: Check examples/sample_scan.json is up to date
+        run: |
+          python examples/demo.py json > /tmp/sample_scan.json
+          python - <<'PY'
+          import json
+          def load(p):
+              d = json.load(open(p))
+              # age_days move with wall-clock time; compare everything else.
+              for f in d["findings"]:
+                  f["detail"].pop("age_days", None)
+                  f["reason"] = f["reason"].split(" (")[0]
+              return d
+          if load("examples/sample_scan.json") != load("/tmp/sample_scan.json"):
+              raise SystemExit(
+                  "examples/sample_scan.json is stale; regenerate with "
+                  "`python examples/demo.py json > examples/sample_scan.json`"
+              )
+          print("sample_scan.json is up to date")
+          PY

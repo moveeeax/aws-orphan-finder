@@ -3,17 +3,22 @@ from __future__ import annotations
 import csv
 import io
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from .models import Finding
+from .models import Finding, ScanError
 
 CSV_FIELDS = ["region", "kind", "resource_id", "monthly_cost", "reason", "detail"]
 
 
-def render_json(findings: List[Finding], summary: Dict[str, Any]) -> str:
+def render_json(
+    findings: List[Finding], summary: Dict[str, Any], errors: Optional[List[ScanError]] = None
+) -> str:
     payload = {
         "findings": [f.to_dict() for f in findings],
         "summary": summary,
+        # Always present so consumers can assert `errors == []` before acting
+        # on the findings. A non-empty list means the scan is incomplete.
+        "errors": [e.to_dict() for e in errors or []],
     }
     return json.dumps(payload, indent=2, default=str)
 
@@ -29,7 +34,9 @@ def render_csv(findings: List[Finding]) -> str:
     return buf.getvalue()
 
 
-def render_table(findings: List[Finding], summary: Dict[str, Any]) -> str:
+def render_table(
+    findings: List[Finding], summary: Dict[str, Any], errors: Optional[List[ScanError]] = None
+) -> str:
     """Render a rich table to a string (no terminal required)."""
     from rich.console import Console
     from rich.table import Table
@@ -66,14 +73,33 @@ def render_table(findings: List[Finding], summary: Dict[str, Any]) -> str:
     )
     console.print(summary_table)
 
+    if errors:
+        error_table = Table(title="INCOMPLETE SCAN - these checks were skipped")
+        error_table.add_column("Region")
+        error_table.add_column("Check")
+        error_table.add_column("Operation")
+        error_table.add_column("Error")
+        for e in errors:
+            error_table.add_row(e.region, e.kind, e.operation, e.code)
+        console.print(error_table)
+        console.print(
+            "Resources covered by a skipped check are absent from the table above; "
+            "absence here does not mean a resource is in use."
+        )
+
     return console.file.getvalue()
 
 
-def render(fmt: str, findings: List[Finding], summary: Dict[str, Any]) -> str:
+def render(
+    fmt: str,
+    findings: List[Finding],
+    summary: Dict[str, Any],
+    errors: Optional[List[ScanError]] = None,
+) -> str:
     if fmt == "json":
-        return render_json(findings, summary)
+        return render_json(findings, summary, errors)
     if fmt == "csv":
         return render_csv(findings)
     if fmt == "table":
-        return render_table(findings, summary)
+        return render_table(findings, summary, errors)
     raise ValueError(f"unknown output format: {fmt}")

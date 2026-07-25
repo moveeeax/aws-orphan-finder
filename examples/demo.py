@@ -17,8 +17,9 @@ NOW = datetime.now(timezone.utc)
 
 
 class DemoEC2:
-    def __init__(self, addresses, volumes, enis, snapshots):
+    def __init__(self, addresses, volumes, enis, snapshots, images=()):
         self._a, self._v, self._e, self._s = addresses, volumes, enis, snapshots
+        self._i = list(images)
 
     def describe_addresses(self, **_):
         return {"Addresses": self._a}
@@ -31,6 +32,9 @@ class DemoEC2:
 
     def describe_snapshots(self, **_):
         return {"Snapshots": self._s}
+
+    def describe_images(self, **_):
+        return {"Images": self._i}
 
 
 DATA = {
@@ -48,7 +52,25 @@ DATA = {
         ],
         enis=[{"NetworkInterfaceId": "eni-0aa", "Status": "available", "SubnetId": "subnet-1"}],
         snapshots=[
-            {"SnapshotId": "snap-0xy", "VolumeSize": 200, "StartTime": NOW - timedelta(days=400)}
+            {
+                "SnapshotId": "snap-0xy",
+                "VolumeSize": 200,
+                "State": "completed",
+                "StartTime": NOW - timedelta(days=400),
+            },
+            # Old, but it backs a registered AMI -- must NOT be reported.
+            {
+                "SnapshotId": "snap-0ami",
+                "VolumeSize": 500,
+                "State": "completed",
+                "StartTime": NOW - timedelta(days=500),
+            },
+        ],
+        images=[
+            {
+                "ImageId": "ami-0abc",
+                "BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-0ami"}}],
+            }
         ],
     ),
     "us-east-1": DemoEC2(
