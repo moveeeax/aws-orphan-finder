@@ -31,7 +31,8 @@
       "reason": "Network interface is detached (available)",
       "detail": {
         "description": "",
-        "subnet_id": "subnet-1"
+        "subnet_id": "subnet-1",
+        "requester_managed": false
       }
     },
     {
@@ -39,7 +40,7 @@
       "kind": "snapshot",
       "resource_id": "snap-0xy",
       "monthly_cost": 10.5,
-      "reason": "EBS snapshot retained for 400 days",
+      "reason": "EBS snapshot retained, not referenced by any self-owned AMI (400 days old)",
       "detail": {
         "size_gb": 200,
         "age_days": 400,
@@ -90,5 +91,6 @@
         "monthly_cost": 10.5
       }
     }
-  }
+  },
+  "errors": []
 }

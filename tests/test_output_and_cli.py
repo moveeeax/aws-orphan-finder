@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import timedelta
 
+import pytest
+
 from aws_orphan_finder import cli, output
-from aws_orphan_finder.models import Finding
+from aws_orphan_finder.models import Finding, ScanError
 from aws_orphan_finder.summary import summarize
 from tests.conftest import FakeEC2
 
@@ -56,6 +59,65 @@ def test_parse_duration_days():
 
 def test_parse_regions():
     assert cli.parse_regions("eu-west-1, us-east-1") == ["eu-west-1", "us-east-1"]
+
+
+def test_parse_regions_deduplicates():
+    """A repeated region would double every finding and double the cost total."""
+    assert cli.parse_regions("us-east-1,us-east-1,eu-west-1") == ["us-east-1", "eu-west-1"]
+
+
+def test_parse_regions_accepts_other_partitions():
+    assert cli.parse_regions("us-gov-west-1,cn-north-1") == ["us-gov-west-1", "cn-north-1"]
+
+
+@pytest.mark.parametrize("bad", ["us_east_1", "useast1", "Europe", "us-east-", "../etc"])
+def test_parse_regions_rejects_malformed(bad):
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.parse_regions(bad)
+
+
+def test_render_json_always_carries_errors_key():
+    findings = _sample_findings()
+    data = json.loads(output.render("json", findings, summarize(findings)))
+    assert data["errors"] == []
+
+
+def test_render_table_marks_an_incomplete_scan():
+    errors = [ScanError("us-east-1", "snapshot", "DescribeImages", "AccessDenied", "nope")]
+    out = output.render("table", [], summarize([]), errors)
+    assert "INCOMPLETE SCAN" in out
+    assert "AccessDenied" in out
+
+
+def test_cli_exits_nonzero_when_a_check_was_skipped(capsys, now):
+    """A partial scan must not look like a clean bill of health to a script."""
+    fake = FakeEC2(
+        snapshots=[{"SnapshotId": "snap-1", "VolumeSize": 10, "StartTime": now}],
+        fail={"describe_images": "AccessDenied"},
+    )
+    rc = cli.main(
+        ["scan", "--regions", "us-east-1", "--output", "json"],
+        client_factory=lambda r: fake,
+    )
+    captured = capsys.readouterr()
+    assert rc == cli.EXIT_INCOMPLETE
+    data = json.loads(captured.out)
+    assert data["findings"] == []
+    assert data["errors"][0]["code"] == "AccessDenied"
+    assert "incomplete" in captured.err
+
+
+def test_cli_ignore_errors_restores_zero_exit(capsys, now):
+    fake = FakeEC2(
+        snapshots=[{"SnapshotId": "snap-1", "VolumeSize": 10, "StartTime": now}],
+        fail={"describe_images": "AccessDenied"},
+    )
+    rc = cli.main(
+        ["scan", "--regions", "us-east-1", "--output", "json", "--ignore-errors"],
+        client_factory=lambda r: fake,
+    )
+    assert rc == 0
+    assert "incomplete" in capsys.readouterr().err
 
 
 def test_cli_end_to_end_json(capsys, now):

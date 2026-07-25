@@ -6,11 +6,21 @@ import sys
 from typing import Any, Callable, List, Optional
 
 from . import __version__, output
+from .models import ScanError
 from .scanner import scan_regions
 from .summary import summarize
 
 _DURATION_RE = re.compile(r"^\s*(\d+)\s*([dwm]?)\s*$", re.IGNORECASE)
 _DURATION_UNIT_DAYS = {"": 1, "d": 1, "w": 7, "m": 30}
+
+# Matches the AWS region naming scheme, including partitions such as
+# us-gov-west-1, cn-north-1, us-iso-east-1 and eusc-de-east-1.
+_REGION_RE = re.compile(r"^[a-z]{2,}(-[a-z]+)+-\d+$")
+
+# Exit code used when at least one check could not be completed, so the report
+# is partial. Callers that pipe this into cleanup automation must not treat a
+# partial scan as an authoritative "nothing else is in use" answer.
+EXIT_INCOMPLETE = 2
 
 
 def parse_duration_days(value: str) -> int:
@@ -24,7 +34,22 @@ def parse_duration_days(value: str) -> int:
 
 
 def parse_regions(value: str) -> List[str]:
-    regions = [r.strip() for r in value.split(",") if r.strip()]
+    """Parse, validate and de-duplicate a comma-separated region list.
+
+    De-duplication matters for correctness, not just tidiness: scanning the
+    same region twice would double every finding and double the reported spend.
+    """
+    regions: List[str] = []
+    for raw in value.split(","):
+        region = raw.strip()
+        if not region:
+            continue
+        if not _REGION_RE.match(region):
+            raise argparse.ArgumentTypeError(
+                f"invalid AWS region '{region}' (expected e.g. eu-west-1, us-east-1)"
+            )
+        if region not in regions:
+            regions.append(region)
     if not regions:
         raise argparse.ArgumentTypeError("no regions provided")
     return regions
@@ -32,11 +57,16 @@ def parse_regions(value: str) -> List[str]:
 
 def _default_client_factory(profile: Optional[str]) -> Callable[[str], Any]:
     import boto3
+    from botocore.config import Config
 
     session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    # Adaptive retries so a throttled Describe* is retried rather than failing
+    # the check. A check that gives up reports nothing, which is safe but makes
+    # a wide scan of a busy account needlessly incomplete.
+    config = Config(retries={"max_attempts": 10, "mode": "adaptive"})
 
     def factory(region: str) -> Any:
-        return session.client("ec2", region_name=region)
+        return session.client("ec2", region_name=region, config=config)
 
     return factory
 
@@ -72,14 +102,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format (default: table)",
     )
     scan.add_argument("--profile", default=None, help="AWS named profile to use")
+    scan.add_argument(
+        "--ignore-errors",
+        dest="ignore_errors",
+        action="store_true",
+        help=(
+            f"exit 0 even if some checks were skipped (default: exit {EXIT_INCOMPLETE} "
+            "so a partial scan is not mistaken for a clean one)"
+        ),
+    )
     return parser
 
 
 def run_scan(args: argparse.Namespace, client_factory: Optional[Callable[[str], Any]] = None) -> int:
     factory = client_factory or _default_client_factory(args.profile)
-    findings = scan_regions(factory, args.regions, older_than_days=args.older_than)
+    errors: List[ScanError] = []
+    findings = scan_regions(
+        factory, args.regions, older_than_days=args.older_than, errors=errors
+    )
     summary = summarize(findings)
-    sys.stdout.write(output.render(args.output, findings, summary) + "\n")
+    sys.stdout.write(output.render(args.output, findings, summary, errors) + "\n")
+
+    for e in errors:
+        sys.stderr.write(
+            f"warning: {e.region}: {e.kind} check skipped "
+            f"({e.operation}: {e.code}) - results are incomplete\n"
+        )
+    if errors and not getattr(args, "ignore_errors", False):
+        sys.stderr.write(
+            f"error: {len(errors)} check(s) could not be completed; "
+            "this report does not list every orphan and must not be treated as "
+            "a complete inventory\n"
+        )
+        return EXIT_INCOMPLETE
     return 0
 
 
