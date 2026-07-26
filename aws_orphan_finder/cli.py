@@ -63,7 +63,19 @@ def _default_client_factory(profile: Optional[str]) -> Callable[[str], Any]:
     # Adaptive retries so a throttled Describe* is retried rather than failing
     # the check. A check that gives up reports nothing, which is safe but makes
     # a wide scan of a busy account needlessly incomplete.
-    config = Config(retries={"max_attempts": 10, "mode": "adaptive"})
+    #
+    # Bounded connect/read timeouts matter just as much as the retry count: a
+    # blackholed endpoint (dropped SYN, VPC misconfiguration, a region that
+    # simply never answers) would otherwise hang on botocore's own defaults
+    # (60s connect + 60s read) for up to 10 attempts -- tens of minutes stuck
+    # on a single region before the check is even reported as skipped. This
+    # tool is meant to run unattended (cron/CI), so a slow failure is as bad
+    # as no failure at all.
+    config = Config(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        connect_timeout=10,
+        read_timeout=30,
+    )
 
     def factory(region: str) -> Any:
         return session.client("ec2", region_name=region, config=config)

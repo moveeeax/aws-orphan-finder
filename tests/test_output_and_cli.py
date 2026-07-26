@@ -89,6 +89,28 @@ def test_render_table_marks_an_incomplete_scan():
     assert "AccessDenied" in out
 
 
+def test_render_table_treats_bracketed_values_as_plain_text():
+    """`output.render` is public API: a caller can hand it any Finding, and a
+    bracketed field must never be parsed as Rich console markup. Before this
+    was fixed, a mismatched tag like "[/mismatched]" raised
+    rich.errors.MarkupError and crashed rendering outright; a well-formed one
+    like "[bold]x[/bold]" would silently apply formatting and strip the tags
+    instead of showing the literal resource text.
+    """
+    findings = [
+        Finding(
+            "us-east-1",
+            "eip",
+            "[/mismatched]",
+            1.0,
+            "reason with [bold]brackets[/bold] in it",
+        ),
+    ]
+    out = output.render("table", findings, summarize(findings))
+    assert "[/mismatched]" in out
+    assert "reason with [bold]brackets[/bold] in it" in out
+
+
 def test_cli_exits_nonzero_when_a_check_was_skipped(capsys, now):
     """A partial scan must not look like a clean bill of health to a script."""
     fake = FakeEC2(
@@ -118,6 +140,42 @@ def test_cli_ignore_errors_restores_zero_exit(capsys, now):
     )
     assert rc == 0
     assert "incomplete" in capsys.readouterr().err
+
+
+def test_default_client_factory_sets_bounded_timeouts(monkeypatch):
+    """A network-level failure (blackholed endpoint, dropped SYN, a region
+    that never answers) must not hang a scan for botocore's full default of
+    60s connect + 60s read times up to 10 retry attempts. The client config
+    needs its own bounded connect/read timeouts, not just a retry count.
+    """
+    import boto3
+
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, profile_name=None):
+            captured["profile_name"] = profile_name
+
+        def client(self, service, region_name=None, config=None):
+            captured["service"] = service
+            captured["region_name"] = region_name
+            captured["config"] = config
+            return "fake-client"
+
+    monkeypatch.setattr(boto3, "Session", FakeSession)
+
+    factory = cli._default_client_factory(None)
+    client = factory("us-east-1")
+
+    assert client == "fake-client"
+    assert captured["service"] == "ec2"
+    assert captured["region_name"] == "us-east-1"
+    config = captured["config"]
+    assert config.connect_timeout is not None
+    assert config.read_timeout is not None
+    # Bounded, not merely "set to something huge".
+    assert config.connect_timeout <= 15
+    assert config.read_timeout <= 60
 
 
 def test_cli_end_to_end_json(capsys, now):

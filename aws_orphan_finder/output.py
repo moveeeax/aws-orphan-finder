@@ -41,7 +41,13 @@ def render_table(
     from rich.console import Console
     from rich.table import Table
 
-    console = Console(file=io.StringIO(), width=120, no_color=True)
+    # markup=False: cell values come from Finding fields, and `render()` is a
+    # public function that library callers can feed arbitrary strings (custom
+    # resource ids, reasons, ...). Rich's default markup parser treats "[" as
+    # the start of a style tag, so any bracketed value -- e.g. a mismatched
+    # "[/foo]" -- would otherwise raise rich.errors.MarkupError and crash a
+    # function that should never fail on ordinary text content.
+    console = Console(file=io.StringIO(), width=120, no_color=True, markup=False)
 
     table = Table(title="Orphaned AWS resources", show_lines=False)
     table.add_column("Region")
