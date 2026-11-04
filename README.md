@@ -1,7 +1,7 @@
 # aws-orphan-finder
 
 [![CI](https://github.com/moveeeax/aws-orphan-finder/actions/workflows/ci.yml/badge.svg)](https://github.com/moveeeax/aws-orphan-finder/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > Find the AWS resources quietly billing you for nothing — and see the monthly savings.
@@ -46,8 +46,10 @@ is actually in use. The predicates are therefore deliberately conservative:
 
 ## Install
 
+The package is not published on PyPI; install it straight from GitHub:
+
 ```bash
-pip install aws-orphan-finder
+pip install git+https://github.com/moveeeax/aws-orphan-finder
 ```
 
 Or from source:
