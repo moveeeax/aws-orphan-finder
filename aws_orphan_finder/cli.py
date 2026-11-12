@@ -6,7 +6,8 @@ import sys
 from typing import Any, Callable, List, Optional
 
 from . import __version__, output
-from .models import ScanError
+from .models import ScanError, ScanOptions
+from .public_ipv4 import scan_public_ipv4
 from .scanner import scan_regions
 from .summary import summarize
 
@@ -55,7 +56,24 @@ def parse_regions(value: str) -> List[str]:
     return regions
 
 
-def _default_client_factory(profile: Optional[str]) -> Callable[[str], Any]:
+def parse_positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        number = -1.0
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"invalid threshold '{value}' (expected a number >= 0)")
+    return number
+
+
+def parse_lookback_days(value: str) -> int:
+    days = parse_duration_days(value)
+    if days < 1:
+        raise argparse.ArgumentTypeError("lookback must be at least 1 day")
+    return days
+
+
+def _default_client_factory(profile: Optional[str]) -> Callable[..., Any]:
     import boto3
     from botocore.config import Config
 
@@ -77,8 +95,8 @@ def _default_client_factory(profile: Optional[str]) -> Callable[[str], Any]:
         read_timeout=30,
     )
 
-    def factory(region: str) -> Any:
-        return session.client("ec2", region_name=region, config=config)
+    def factory(region: str, service: str = "ec2") -> Any:
+        return session.client(service, region_name=region, config=config)
 
     return factory
 
@@ -103,15 +121,64 @@ def build_parser() -> argparse.ArgumentParser:
         dest="older_than",
         type=parse_duration_days,
         default=None,
-        help="only report volumes/snapshots older than this age (e.g. 30d, 2w)",
+        help=(
+            "only report volumes, snapshots and stopped instances older than this age "
+            "(e.g. 30d, 2w)"
+        ),
+    )
+    scan.add_argument(
+        "--idle-lookback",
+        "--lb-lookback",
+        dest="idle_lookback",
+        type=parse_lookback_days,
+        default=ScanOptions.idle_lookback_days,
+        help=(
+            "CloudWatch window for load balancer and NAT gateway traffic; younger "
+            "resources are not judged (default: 14d)"
+        ),
+    )
+    scan.add_argument(
+        "--idle-min-traffic",
+        "--lb-min-traffic",
+        dest="idle_min_traffic",
+        type=parse_positive_float,
+        default=ScanOptions.idle_min_traffic,
+        help=(
+            "traffic over the lookback below which a load balancer or NAT gateway is "
+            "idle: requests (ALB, CLB), new flows (NLB, GWLB), packets out (NAT) "
+            "(default: 100)"
+        ),
+    )
+    scan.add_argument(
+        "--ami-unused",
+        dest="ami_unused",
+        type=parse_lookback_days,
+        default=ScanOptions.ami_unused_days,
+        help="report self-owned AMIs not launched within this age (default: 90d)",
+    )
+    scan.add_argument(
+        "--group-by",
+        dest="group_by",
+        choices=["none", "volume"],
+        default="none",
+        help="'volume' collapses snapshots into one row per source volume (table, html, json)",
+    )
+    scan.add_argument(
+        "--public-ipv4",
+        dest="public_ipv4",
+        action="store_true",
+        help="also report every public IPv4 address and its cost, grouped by owner",
     )
     scan.add_argument(
         "--output",
         "--format",
         dest="output",
-        choices=["table", "json", "csv"],
+        choices=list(output.FORMATS),
         default="table",
-        help="output format (default: table)",
+        help=(
+            "output format (default: table); 'commands' prints the AWS CLI command for "
+            "each finding, commented out"
+        ),
     )
     scan.add_argument("--profile", default=None, help="AWS named profile to use")
     scan.add_argument(
@@ -126,14 +193,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_scan(args: argparse.Namespace, client_factory: Optional[Callable[[str], Any]] = None) -> int:
-    factory = client_factory or _default_client_factory(args.profile)
+def run_scan(
+    args: argparse.Namespace,
+    client_factory: Optional[Callable[[str], Any]] = None,
+    service_factory: Optional[Callable[[str, str], Any]] = None,
+) -> int:
+    if client_factory is None:
+        factory = _default_client_factory(args.profile)
+        client_factory = factory
+        service_factory = service_factory or factory
+    # An injected EC2-only factory (tests, library use) gets no service
+    # clients unless one is passed too; the load balancer and NAT gateway
+    # checks then do not run.
+    options = ScanOptions(
+        idle_lookback_days=getattr(args, "idle_lookback", ScanOptions.idle_lookback_days),
+        idle_min_traffic=getattr(args, "idle_min_traffic", ScanOptions.idle_min_traffic),
+        ami_unused_days=getattr(args, "ami_unused", ScanOptions.ami_unused_days),
+    )
     errors: List[ScanError] = []
     findings = scan_regions(
-        factory, args.regions, older_than_days=args.older_than, errors=errors
+        client_factory,
+        args.regions,
+        older_than_days=args.older_than,
+        errors=errors,
+        service_factory=service_factory,
+        options=options,
     )
+    public_ipv4 = None
+    if getattr(args, "public_ipv4", False):
+        public_ipv4 = scan_public_ipv4(client_factory, args.regions, errors)
     summary = summarize(findings)
-    sys.stdout.write(output.render(args.output, findings, summary, errors) + "\n")
+    group_by = getattr(args, "group_by", "none")
+    sys.stdout.write(
+        output.render(
+            args.output,
+            findings,
+            summary,
+            errors,
+            public_ipv4=public_ipv4,
+            group_by=None if group_by == "none" else group_by,
+        )
+        + "\n"
+    )
 
     for e in errors:
         sys.stderr.write(
@@ -150,11 +251,15 @@ def run_scan(args: argparse.Namespace, client_factory: Optional[Callable[[str], 
     return 0
 
 
-def main(argv: Optional[List[str]] = None, client_factory: Optional[Callable[[str], Any]] = None) -> int:
+def main(
+    argv: Optional[List[str]] = None,
+    client_factory: Optional[Callable[[str], Any]] = None,
+    service_factory: Optional[Callable[[str, str], Any]] = None,
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "scan":
-        return run_scan(args, client_factory=client_factory)
+        return run_scan(args, client_factory=client_factory, service_factory=service_factory)
     parser.error("no command")
     return 2
 
