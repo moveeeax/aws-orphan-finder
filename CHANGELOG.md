@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-12
 
 ### Added
 
@@ -79,5 +79,6 @@ All notable changes to this project are documented here. The format follows
   unattached ENIs and stale snapshots across regions, with monthly cost
   estimates and table/JSON output.
 
+[0.3.0]: https://github.com/moveeeax/aws-orphan-finder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/moveeeax/aws-orphan-finder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/moveeeax/aws-orphan-finder/releases/tag/v0.1.0
