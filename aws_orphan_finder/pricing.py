@@ -2,9 +2,26 @@ from __future__ import annotations
 
 HOURS_PER_MONTH = 730.0
 
-# Idle Elastic IP: AWS bills roughly $0.005 / hour for an EIP not associated
-# with a running instance. https://aws.amazon.com/vpc/pricing/
-_EIP_HOURLY = 0.005
+# Public IPv4: since 2024-02-01 AWS bills $0.005 / hour for every public IPv4
+# address, in use or idle, attached or not, at the same rate in every
+# commercial region. https://aws.amazon.com/vpc/pricing/
+# Addresses brought to AWS with BYOIP are not charged.
+_PUBLIC_IPV4_HOURLY = 0.005
+
+# Hourly charge of an idle load balancer, us-east-1, excluding LCUs (an idle
+# balancer consumes next to none). Gateway Load Balancers bill per enabled
+# Availability Zone. https://aws.amazon.com/elasticloadbalancing/pricing/
+_LB_HOURLY = {
+    "application": 0.0225,
+    "network": 0.0225,
+    "classic": 0.025,
+}
+_GWLB_HOURLY_PER_AZ = 0.0125
+
+# NAT gateway hourly charge, excluding per-GB processing (zero for an idle
+# gateway). AWS publishes $0.045 / hour in its US East pricing example.
+# https://aws.amazon.com/vpc/pricing/
+_NAT_GATEWAY_HOURLY = 0.045
 
 # EBS storage price ($ per GB-month), us-east-1 baseline, by volume type.
 _EBS_GB_MONTH = {
@@ -45,8 +62,28 @@ def region_multiplier(region: str) -> float:
     return _REGION_MULTIPLIER.get(region, 1.0)
 
 
+def public_ipv4_monthly(region: str, byoip: bool = False) -> float:
+    # No regional multiplier: the IPv4 rate is the same in every commercial
+    # region. `region` is kept so every pricing helper has the same shape.
+    if byoip:
+        return 0.0
+    return _PUBLIC_IPV4_HOURLY * HOURS_PER_MONTH
+
+
 def eip_monthly(region: str) -> float:
-    return _EIP_HOURLY * HOURS_PER_MONTH * region_multiplier(region)
+    return public_ipv4_monthly(region)
+
+
+def load_balancer_monthly(region: str, lb_type: str, az_count: int = 1) -> float:
+    if lb_type == "gateway":
+        hourly = _GWLB_HOURLY_PER_AZ * max(az_count, 1)
+    else:
+        hourly = _LB_HOURLY.get(lb_type, _LB_HOURLY["application"])
+    return hourly * HOURS_PER_MONTH * region_multiplier(region)
+
+
+def nat_gateway_monthly(region: str) -> float:
+    return _NAT_GATEWAY_HOURLY * HOURS_PER_MONTH * region_multiplier(region)
 
 
 def ebs_volume_monthly(region: str, volume_type: str, size_gb: float) -> float:

@@ -115,16 +115,39 @@ def test_scan_region_aggregates_all_kinds(now):
 
 
 def test_scan_regions_multi_region_aggregation(now):
+    def vol(vid):
+        return {"VolumeId": vid, "State": "available", "Size": 100, "VolumeType": "gp3",
+                "CreateTime": now - timedelta(days=1)}
+
     data = {
-        "eu-west-1": FakeEC2(addresses=[{"AllocationId": "a1", "PublicIp": "1.1.1.1"}]),
-        "us-east-1": FakeEC2(addresses=[{"AllocationId": "a2", "PublicIp": "2.2.2.2"}]),
+        "eu-west-1": FakeEC2(volumes=[vol("vol-eu")]),
+        "us-east-1": FakeEC2(volumes=[vol("vol-us")]),
     }
     findings = scanner.scan_regions(lambda r: data[r], ["eu-west-1", "us-east-1"], now)
     assert {f.region for f in findings} == {"eu-west-1", "us-east-1"}
-    # eu-west-1 multiplier (1.05) makes its EIP cost higher than us-east-1 (1.0)
+    # eu-west-1 multiplier (1.05) makes its EBS cost higher than us-east-1 (1.0)
     eu = next(f for f in findings if f.region == "eu-west-1")
     us = next(f for f in findings if f.region == "us-east-1")
     assert eu.monthly_cost > us.monthly_cost
+
+
+def test_public_ipv4_rate_is_the_same_in_every_region(now):
+    """AWS charges $0.005/h per public IPv4 in all commercial regions."""
+    data = {
+        "sa-east-1": FakeEC2(addresses=[{"AllocationId": "a1", "PublicIp": "1.1.1.1"}]),
+        "us-east-1": FakeEC2(addresses=[{"AllocationId": "a2", "PublicIp": "2.2.2.2"}]),
+    }
+    findings = scanner.scan_regions(lambda r: data[r], ["sa-east-1", "us-east-1"], now)
+    assert {round(f.monthly_cost, 2) for f in findings} == {3.65}
+
+
+def test_byoip_elastic_ip_costs_nothing(now):
+    ec2 = FakeEC2(
+        addresses=[{"AllocationId": "a1", "PublicIp": "1.1.1.1", "PublicIpv4Pool": "ipv4pool-ec2-1"}]
+    )
+    findings = scanner.scan_eips(ec2, "us-east-1")
+    assert findings[0].monthly_cost == 0.0
+    assert findings[0].detail["public_ipv4_pool"] == "ipv4pool-ec2-1"
 
 
 def test_never_mutates(now):
@@ -269,8 +292,10 @@ def test_access_denied_on_describe_images_skips_the_whole_snapshot_check(now):
     findings = scanner.scan_region(ec2, "us-east-1", now, errors=errors)
 
     assert [f.kind for f in findings if f.kind == "snapshot"] == []
+    # The AMI check reads DescribeImages too, so it is skipped alongside.
     assert [(e.kind, e.code, e.operation) for e in errors] == [
-        ("snapshot", "AccessDenied", "DescribeImages")
+        ("snapshot", "AccessDenied", "DescribeImages"),
+        ("ami", "AccessDenied", "DescribeImages"),
     ]
 
 
@@ -357,3 +382,176 @@ def test_pagination_failure_does_not_return_a_partial_page(now):
 def test_scan_error_is_serialisable():
     e = ScanError("us-east-1", "snapshot", "DescribeImages", "AccessDenied", "nope")
     assert e.to_dict()["code"] == "AccessDenied"
+
+
+# --- stopped instances (#8) and EIPs on them (#6) --------------------------
+
+
+def _stopped(instance_id, stopped_days_ago, now, volumes=(), reason=None):
+    stopped_at = now - timedelta(days=stopped_days_ago)
+    return {
+        "InstanceId": instance_id,
+        "InstanceType": "t3.large",
+        "State": {"Name": "stopped"},
+        "StateTransitionReason": reason
+        if reason is not None
+        else f"User initiated ({stopped_at:%Y-%m-%d %H:%M:%S} GMT)",
+        "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeId": v}} for v in volumes],
+    }
+
+
+def test_stopped_instance_reports_volume_cost_and_eip_separately(now):
+    ec2 = FakeEC2(
+        instances=[
+            _stopped("i-stopped", 45, now, volumes=["vol-root", "vol-data"]),
+            {"InstanceId": "i-running", "State": {"Name": "running"}},
+        ],
+        volumes=[
+            {"VolumeId": "vol-root", "State": "in-use", "Size": 20, "VolumeType": "gp3",
+             "Attachments": [{"InstanceId": "i-stopped"}]},
+            {"VolumeId": "vol-data", "State": "in-use", "Size": 100, "VolumeType": "gp2",
+             "Attachments": [{"InstanceId": "i-stopped"}]},
+        ],
+        addresses=[
+            {"AllocationId": "eipalloc-s", "PublicIp": "9.9.9.9", "InstanceId": "i-stopped",
+             "AssociationId": "eipassoc-1"},
+            {"AllocationId": "eipalloc-r", "PublicIp": "8.8.8.8", "InstanceId": "i-running"},
+        ],
+    )
+    findings = scanner.scan_stopped_instances(ec2, "us-east-1", now, older_than_days=30)
+    by_kind = {f.kind: f for f in findings}
+    assert set(by_kind) == {"stopped_instance", "eip_stopped_instance"}
+
+    inst = by_kind["stopped_instance"]
+    assert inst.resource_id == "i-stopped"
+    # 20 GiB gp3 @ 0.08 + 100 GiB gp2 @ 0.10 = 1.60 + 10.00
+    assert round(inst.monthly_cost, 2) == 11.60
+    assert "vol-root (20 GiB gp3)" in inst.reason
+    assert "vol-data (100 GiB gp2)" in inst.reason
+    assert "9.9.9.9" in inst.reason
+    assert inst.detail["age_days"] == 45
+
+    eip = by_kind["eip_stopped_instance"]
+    assert eip.resource_id == "eipalloc-s"
+    assert round(eip.monthly_cost, 2) == 3.65
+    assert "i-stopped" in eip.reason and "stopped since" in eip.reason
+    # The EIP of the running instance is in use and not reported anywhere.
+    assert all(f.detail.get("public_ip") != "8.8.8.8" for f in findings)
+
+
+def test_stopped_instance_honours_older_than(now):
+    ec2 = FakeEC2(instances=[_stopped("i-recent", 3, now), _stopped("i-old", 60, now)])
+    findings = scanner.scan_stopped_instances(ec2, "us-east-1", now, older_than_days=30)
+    assert [f.resource_id for f in findings] == ["i-old"]
+
+
+def test_stopped_instance_with_unreadable_stop_time_needs_no_age_filter(now):
+    """Unknown age is not old age: with --older-than it is skipped."""
+    ec2 = FakeEC2(instances=[_stopped("i-x", 0, now, reason="")])
+    assert scanner.scan_stopped_instances(ec2, "us-east-1", now, older_than_days=30) == []
+    findings = scanner.scan_stopped_instances(ec2, "us-east-1", now)
+    assert [f.resource_id for f in findings] == ["i-x"]
+    assert findings[0].detail["age_days"] is None
+
+
+def test_stopped_instance_check_failure_is_isolated(now):
+    ec2 = FakeEC2(
+        addresses=[{"AllocationId": "eipalloc-1", "PublicIp": "1.2.3.4"}],
+        fail={"describe_instances": "UnauthorizedOperation"},
+    )
+    errors = []
+    findings = scanner.scan_region(ec2, "us-east-1", now, errors=errors)
+    assert [f.kind for f in findings] == ["eip"]
+    assert [(e.kind, e.operation) for e in errors] == [("stopped_instance", "DescribeInstances")]
+
+
+# --- AMIs and snapshot sprawl (#5) ------------------------------------------
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def test_unused_ami_is_reported_with_backing_snapshot_cost(now):
+    ec2 = FakeEC2(
+        images=[
+            {
+                "ImageId": "ami-stale",
+                "State": "available",
+                "CreationDate": _iso(now - timedelta(days=400)),
+                "LastLaunchedTime": _iso(now - timedelta(days=200)),
+                "BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-a", "VolumeSize": 30}}],
+            },
+            {
+                "ImageId": "ami-fresh",
+                "State": "available",
+                "CreationDate": _iso(now - timedelta(days=400)),
+                "LastLaunchedTime": _iso(now - timedelta(days=5)),
+            },
+            {
+                "ImageId": "ami-never",
+                "State": "available",
+                "CreationDate": _iso(now - timedelta(days=120)),
+            },
+            {
+                "ImageId": "ami-new",
+                "State": "available",
+                "CreationDate": _iso(now - timedelta(days=10)),
+            },
+        ]
+    )
+    findings = scanner.scan_amis(ec2, "us-east-1", now, unused_days=90)
+    assert {f.resource_id for f in findings} == {"ami-stale", "ami-never"}
+    stale = next(f for f in findings if f.resource_id == "ami-stale")
+    assert stale.detail["age_days"] == 200
+    assert stale.detail["snapshot_ids"] == ["snap-a"]
+    assert round(stale.monthly_cost, 2) == 1.50  # 30 GB @ 0.05
+    never = next(f for f in findings if f.resource_id == "ami-never")
+    assert "no recorded launch" in never.reason
+
+
+def test_ami_in_a_launch_template_is_not_reported(now):
+    ec2 = FakeEC2(
+        images=[
+            {"ImageId": "ami-asg", "State": "available",
+             "CreationDate": _iso(now - timedelta(days=400))},
+        ],
+        launch_templates={"lt-1": [{"LaunchTemplateData": {"ImageId": "ami-asg"}}]},
+    )
+    assert scanner.scan_amis(ec2, "us-east-1", now, unused_days=90) == []
+
+
+def test_ami_check_fails_whole_if_launch_templates_cannot_be_read(now):
+    ec2 = FakeEC2(
+        images=[{"ImageId": "ami-1", "State": "available",
+                 "CreationDate": _iso(now - timedelta(days=400))}],
+        fail={"describe_launch_templates": "AccessDenied"},
+    )
+    errors = []
+    findings = scanner.scan_region(ec2, "us-east-1", now, errors=errors)
+    assert [f for f in findings if f.kind == "ami"] == []
+    assert [(e.kind, e.operation) for e in errors] == [("ami", "DescribeLaunchTemplates")]
+
+
+def test_snapshot_detail_names_source_volume_and_whether_it_exists(now):
+    ec2 = FakeEC2(
+        volumes=[{"VolumeId": "vol-live", "State": "in-use", "Size": 10}],
+        snapshots=[
+            {"SnapshotId": "snap-1", "VolumeId": "vol-live", "VolumeSize": 10,
+             "State": "completed", "StartTime": now - timedelta(days=10)},
+            {"SnapshotId": "snap-2", "VolumeId": "vol-gone", "VolumeSize": 10,
+             "State": "completed", "StartTime": now - timedelta(days=10)},
+            {"SnapshotId": "snap-3", "VolumeId": "vol-ffffffff", "VolumeSize": 10,
+             "State": "completed", "StartTime": now - timedelta(days=10),
+             "Description": "[Copied snap-0abc from us-east-1]"},
+        ],
+    )
+    findings = {f.resource_id: f for f in scanner.scan_snapshots(ec2, "eu-west-1", now)}
+    assert findings["snap-1"].detail["source_volume_exists"] is True
+    assert "no longer exists" not in findings["snap-1"].reason
+    assert findings["snap-2"].detail["source_volume_exists"] is False
+    assert "source volume vol-gone no longer exists" in findings["snap-2"].reason
+    copy = findings["snap-3"]
+    assert copy.detail["volume_id"] is None
+    assert copy.detail["copied_from"] == {"snapshot_id": "snap-0abc", "region": "us-east-1"}
+    assert "cross-region copy of snap-0abc from us-east-1" in copy.reason

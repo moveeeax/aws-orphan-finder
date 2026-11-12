@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `stopped_instance`: stopped instances whose EBS volumes keep billing, aged by
+  the stop time in `StateTransitionReason` and filtered by `--older-than`.
+- `eip_stopped_instance`: Elastic IPs attached to those instances.
+- `load_balancer`: idle ALB, NLB, GWLB and Classic Load Balancers, judged by
+  registered targets and CloudWatch traffic (`--lb-lookback`,
+  `--lb-min-traffic`). Redirect-only ALBs are judged by traffic only; missing
+  datapoints are never treated as zero.
+- `nat_gateway`: NAT gateways with near-zero `PacketsOutToDestination`.
+- `ami`: self-owned AMIs not launched within `--ami-unused` (default 90 days)
+  and not named by a launch template.
+- Snapshot findings name the source volume, say whether it still exists, and
+  flag cross-region copies. `--group-by volume` collapses a chain into one row
+  and adds `snapshot_groups` to JSON.
+- `--public-ipv4`: every public IPv4 address and its cost, grouped by owner,
+  plus subnets with `MapPublicIpOnLaunch`.
+- `--format html` and `--format commands` (commented-out AWS CLI commands for
+  every finding).
+
+### Changed
+
+- Public IPv4 is priced at a flat $0.005/hour in every region (AWS's rate since
+  2024-02-01); the regional multiplier no longer applies to it. BYOIP addresses
+  are priced at $0.
+- The CLI needs `elasticloadbalancing:Describe*` and
+  `cloudwatch:GetMetricStatistics` for the new checks; without them only those
+  checks are skipped.
+- Library: `scan_region` runs the new EC2 checks, so a custom EC2 client must
+  also answer `describe_instances` and `describe_launch_templates`.
+  `scan_regions(..., service_factory=...)` enables the load balancer and NAT
+  gateway checks.
+
 ## [0.2.0] - 2026-11-04
 
 ### Fixed

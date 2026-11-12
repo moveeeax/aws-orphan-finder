@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set
 
-from . import pricing
-from .models import Finding, ScanError
+from . import idle, pricing
+from ._aws import CheckFailed, age_days, as_datetime, call, name_tag, paginate
+from .models import Finding, ScanError, ScanOptions
 
-try:  # botocore ships with boto3, which is a hard dependency
-    from botocore.exceptions import BotoCoreError, ClientError
-
-    _AWS_ERRORS: Tuple[type, ...] = (BotoCoreError, ClientError)
-except ImportError:  # pragma: no cover - only if botocore is unavailable
-    _AWS_ERRORS = ()
+# Kept under their pre-0.3 private names for callers and tests that import them.
+_call = call
+_paginate = paginate
+_name_tag = name_tag
+_age_days = age_days
 
 # Type of the client factory: given a region, return an object exposing the
 # EC2 describe_* calls used below. Injectable so tests can supply fakes and the
 # production path can hand back a real boto3 client.
 ClientFactory = Callable[[str], Any]
+
+# Factory for the non-EC2 clients (elbv2, elb, cloudwatch): (region, service).
+# Optional: without one, the checks that need those services are not run.
+ServiceFactory = Callable[[str, str], Any]
 
 # An EIP is in use if any of these is set. AssociationId alone is not enough:
 # an address attached to an EC2-Classic instance reports InstanceId with no
@@ -27,88 +32,23 @@ _EIP_IN_USE_FIELDS = ("AssociationId", "InstanceId", "NetworkInterfaceId")
 # written (its source is actively in use) and an errored one bills nothing.
 _SNAPSHOT_READY_STATE = "completed"
 
+# CopySnapshot and CopyImage give the copy this placeholder as its VolumeId;
+# it never names a real volume.
+_PLACEHOLDER_VOLUME_ID = "vol-ffffffff"
 
-class CheckFailed(Exception):
-    """A check could not be completed, so it must report nothing at all.
+# Default description CopySnapshot writes on a copy: "[Copied snap-x from us-east-1]".
+_COPIED_SNAPSHOT_RE = re.compile(r"\[Copied (snap-[0-9a-f]+) from ([a-z0-9-]+)\]")
 
-    Reporting an empty or partial result for a failed check is precisely how a
-    false positive is manufactured: an AccessDenied on DescribeImages would
-    otherwise make every AMI-backed snapshot look unreferenced, and the tool
-    would recommend deleting the backing store of live machine images.
-    """
-
-    def __init__(self, operation: str, code: str, message: str) -> None:
-        super().__init__(f"{operation}: {code}: {message}")
-        self.operation = operation
-        self.code = code
-        self.message = message
+# StateTransitionReason of a stopped instance carries the stop time, e.g.
+# "User initiated (2026-10-01 12:34:56 GMT)". It is the only place the EC2 API
+# exposes it; there is no structured field.
+_STOPPED_AT_RE = re.compile(r"\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GMT\)")
 
 
-def _error_parts(exc: BaseException) -> Tuple[str, str]:
-    """Pull (code, message) out of a botocore exception as best we can."""
-    response = getattr(exc, "response", None)
-    if isinstance(response, dict):
-        err = response.get("Error") or {}
-        if isinstance(err, dict) and err.get("Code"):
-            return str(err["Code"]), str(err.get("Message") or exc)
-    return exc.__class__.__name__, str(exc)
-
-
-def _call(fn: Callable[..., Any], operation: str, **kwargs: Any) -> Any:
-    """Invoke one AWS call, converting any AWS-side failure into CheckFailed.
-
-    Throttling (RequestLimitExceeded) is retried inside botocore via the client
-    config; if it still surfaces here the check is abandoned rather than being
-    reported as an empty result.
-    """
-    try:
-        return fn(**kwargs)
-    except _AWS_ERRORS as exc:  # type: ignore[misc]
-        code, message = _error_parts(exc)
-        raise CheckFailed(operation, code, message) from exc
-
-
-def _paginate(
-    fn: Callable[..., Dict[str, Any]], key: str, operation: str, **kwargs: Any
-) -> List[Dict[str, Any]]:
-    """Follow NextToken pagination for a describe_* call, collecting `key`.
-
-    Every page must succeed. A failure part-way through raises rather than
-    returning the pages gathered so far -- a truncated listing of *attachments*
-    is what turns an in-use resource into a reported orphan.
-    """
-    items: List[Dict[str, Any]] = []
-    token: Optional[str] = None
-    seen_tokens: Set[str] = set()
-    while True:
-        params = dict(kwargs)
-        if token:
-            params["NextToken"] = token
-        resp = _call(fn, operation, **params)
-        items.extend(resp.get(key, []) or [])
-        token = resp.get("NextToken")
-        if not token:
-            break
-        if token in seen_tokens:
-            # A server repeating a token would otherwise spin forever.
-            raise CheckFailed(operation, "PaginationLoop", "NextToken repeated by the API")
-        seen_tokens.add(token)
-    return items
-
-
-def _name_tag(tags: Optional[List[Dict[str, str]]]) -> Optional[str]:
-    for t in tags or []:
-        if t.get("Key") == "Name":
-            return t.get("Value")
-    return None
-
-
-def _age_days(created: Optional[datetime], now: datetime) -> Optional[int]:
-    if created is None:
-        return None
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    return int((now - created).total_seconds() // 86400)
+def _is_byoip(addr: Dict[str, Any]) -> bool:
+    """An address from a BYOIP pool is not billed the public IPv4 rate."""
+    pool = addr.get("PublicIpv4Pool")
+    return bool(pool) and pool != "amazon"
 
 
 def scan_eips(ec2: Any, region: str) -> List[Finding]:
@@ -123,12 +63,15 @@ def scan_eips(ec2: Any, region: str) -> List[Finding]:
         name = _name_tag(addr.get("Tags"))
         if name:
             detail["name"] = name
+        byoip = _is_byoip(addr)
+        if byoip:
+            detail["public_ipv4_pool"] = addr.get("PublicIpv4Pool")
         findings.append(
             Finding(
                 region=region,
                 kind="eip",
                 resource_id=rid,
-                monthly_cost=pricing.eip_monthly(region),
+                monthly_cost=pricing.public_ipv4_monthly(region, byoip=byoip),
                 reason="Elastic IP not associated with any instance or interface",
                 detail=detail,
             )
@@ -233,6 +176,13 @@ def ami_backed_snapshot_ids(ec2: Any) -> Set[str]:
     return in_use
 
 
+def _source_volume(snapshot: Dict[str, Any]) -> Optional[str]:
+    volume_id = snapshot.get("VolumeId")
+    if not volume_id or volume_id == _PLACEHOLDER_VOLUME_ID:
+        return None
+    return volume_id
+
+
 def scan_snapshots(
     ec2: Any, region: str, now: datetime, older_than_days: Optional[int] = None
 ) -> List[Finding]:
@@ -240,11 +190,14 @@ def scan_snapshots(
 
     The AMI lookup happens first and on purpose: if it fails the whole check
     fails, because a snapshot list with no AMI cross-reference would flag every
-    image-backing snapshot as deletable waste.
+    image-backing snapshot as deletable waste. The volume listing is only used
+    to say whether the source volume still exists, but it is just as
+    all-or-nothing: a truncated list would claim live volumes were deleted.
     """
     in_use = ami_backed_snapshot_ids(ec2)
     findings: List[Finding] = []
     snaps = _paginate(ec2.describe_snapshots, "Snapshots", "DescribeSnapshots", OwnerIds=["self"])
+    candidates = []
     for s in snaps:
         snapshot_id = s.get("SnapshotId", "unknown")
         if snapshot_id in in_use:
@@ -254,19 +207,262 @@ def scan_snapshots(
         age = _age_days(s.get("StartTime"), now)
         if older_than_days is not None and (age is None or age < older_than_days):
             continue
+        candidates.append((s, snapshot_id, age))
+    if not candidates:
+        return findings
+
+    existing_volumes = {
+        v.get("VolumeId")
+        for v in _paginate(ec2.describe_volumes, "Volumes", "DescribeVolumes")
+    }
+    for s, snapshot_id, age in candidates:
         size = s.get("VolumeSize", 0)
-        detail = {"size_gb": size, "age_days": age, "description": s.get("Description", "")}
+        description = s.get("Description", "")
+        volume_id = _source_volume(s)
+        detail: Dict[str, Any] = {
+            "size_gb": size,
+            "age_days": age,
+            "description": description,
+            "volume_id": volume_id,
+            "source_volume_exists": volume_id in existing_volumes if volume_id else None,
+        }
+        reason = "EBS snapshot retained, not referenced by any self-owned AMI"
+        copied = _COPIED_SNAPSHOT_RE.search(description or "")
+        if copied:
+            detail["copied_from"] = {"snapshot_id": copied.group(1), "region": copied.group(2)}
+            if copied.group(2) != region:
+                # A cross-region copy starts as a full copy of the data, not an
+                # increment, so it is usually the most expensive snapshot.
+                reason += f"; cross-region copy of {copied.group(1)} from {copied.group(2)}"
+        elif volume_id and volume_id not in existing_volumes:
+            reason += f"; source volume {volume_id} no longer exists"
+        if age is not None:
+            reason += f" ({age} days old)"
         findings.append(
             Finding(
                 region=region,
                 kind="snapshot",
                 resource_id=snapshot_id,
                 monthly_cost=pricing.snapshot_monthly(region, size),
-                reason="EBS snapshot retained, not referenced by any self-owned AMI"
-                + (f" ({age} days old)" if age is not None else ""),
+                reason=reason,
                 detail=detail,
             )
         )
+    return findings
+
+
+def launch_template_image_ids(ec2: Any) -> Set[str]:
+    """AMI IDs named by the default or latest version of any launch template.
+
+    An AMI that nothing has launched recently is still in use if an Auto
+    Scaling group or a deploy script will launch it from a template tomorrow.
+    Templates that resolve the AMI through an SSM parameter cannot be matched.
+    """
+    templates = _paginate(
+        ec2.describe_launch_templates, "LaunchTemplates", "DescribeLaunchTemplates"
+    )
+    image_ids: Set[str] = set()
+    for t in templates:
+        versions = _paginate(
+            ec2.describe_launch_template_versions,
+            "LaunchTemplateVersions",
+            "DescribeLaunchTemplateVersions",
+            LaunchTemplateId=t.get("LaunchTemplateId"),
+            Versions=["$Default", "$Latest"],
+        )
+        for v in versions:
+            image_id = (v.get("LaunchTemplateData") or {}).get("ImageId")
+            if image_id:
+                image_ids.add(image_id)
+    return image_ids
+
+
+def scan_amis(ec2: Any, region: str, now: datetime, unused_days: int) -> List[Finding]:
+    """Self-owned AMIs not launched in `unused_days` and not named by a launch template.
+
+    The cost is what the backing snapshots would bill at full size. Snapshots
+    are incremental, so the real figure can be lower; it cannot be higher.
+    Those snapshots are never reported by the snapshot check (they back an
+    AMI), so the AMI row is the only place their cost shows up.
+    """
+    images = _paginate(ec2.describe_images, "Images", "DescribeImages", Owners=["self"])
+    candidates = []
+    for img in images:
+        if img.get("State", "available") != "available":
+            continue
+        created = as_datetime(img.get("CreationDate"))
+        last_launched = as_datetime(img.get("LastLaunchedTime"))
+        dates = [d for d in (created, last_launched) if d is not None]
+        if not dates:
+            continue  # no date at all: cannot prove it is unused
+        idle_days = int((now - max(dates)).total_seconds() // 86400)
+        if idle_days < unused_days:
+            continue
+        candidates.append((img, last_launched, idle_days))
+    findings: List[Finding] = []
+    if not candidates:
+        return findings
+
+    templated = launch_template_image_ids(ec2)
+    for img, last_launched, idle_days in candidates:
+        image_id = img.get("ImageId", "unknown")
+        if image_id in templated:
+            continue
+        snapshot_ids = []
+        size = 0
+        for bdm in img.get("BlockDeviceMappings", []) or []:
+            ebs = bdm.get("Ebs") or {}
+            if ebs.get("SnapshotId"):
+                snapshot_ids.append(ebs["SnapshotId"])
+                size += ebs.get("VolumeSize", 0) or 0
+        if last_launched is not None:
+            reason = f"AMI not launched in {idle_days} days and not in any launch template"
+        else:
+            reason = (
+                "AMI has no recorded launch and is not in any launch template "
+                f"(created {idle_days} days ago)"
+            )
+        detail: Dict[str, Any] = {
+            "name": img.get("Name"),
+            "snapshot_ids": snapshot_ids,
+            "size_gb": size,
+            "last_launched": last_launched.isoformat() if last_launched else None,
+            "age_days": idle_days,
+        }
+        findings.append(
+            Finding(
+                region=region,
+                kind="ami",
+                resource_id=image_id,
+                monthly_cost=pricing.snapshot_monthly(region, size),
+                reason=reason,
+                detail=detail,
+            )
+        )
+    return findings
+
+
+def _stopped_at(instance: Dict[str, Any]) -> Optional[datetime]:
+    m = _STOPPED_AT_RE.search(instance.get("StateTransitionReason") or "")
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def scan_stopped_instances(
+    ec2: Any, region: str, now: datetime, older_than_days: Optional[int] = None
+) -> List[Finding]:
+    """Stopped instances whose EBS volumes keep billing, plus their Elastic IPs.
+
+    Two kinds come out of one pass so the money is counted once:
+    `stopped_instance` carries the cost of the attached volumes, and every
+    Elastic IP on the instance is its own `eip_stopped_instance` row with the
+    public IPv4 rate, since releasing an address and terminating an instance
+    are separate decisions.
+
+    With `older_than_days`, an instance whose stop time cannot be read from
+    StateTransitionReason is skipped: an unknown age is not an old age.
+    """
+    reservations = _paginate(
+        ec2.describe_instances,
+        "Reservations",
+        "DescribeInstances",
+        Filters=[{"Name": "instance-state-name", "Values": ["stopped"]}],
+    )
+    instances = [
+        i
+        for r in reservations
+        for i in (r.get("Instances") or [])
+        if (i.get("State") or {}).get("Name") == "stopped"
+    ]
+    if not instances:
+        return []
+
+    addresses_by_instance: Dict[str, List[Dict[str, Any]]] = {}
+    for addr in _paginate(ec2.describe_addresses, "Addresses", "DescribeAddresses"):
+        if addr.get("InstanceId"):
+            addresses_by_instance.setdefault(addr["InstanceId"], []).append(addr)
+
+    volumes_by_id = {
+        v.get("VolumeId"): v
+        for v in _paginate(
+            ec2.describe_volumes,
+            "Volumes",
+            "DescribeVolumes",
+            Filters=[{"Name": "status", "Values": ["in-use"]}],
+        )
+    }
+
+    findings: List[Finding] = []
+    for inst in instances:
+        instance_id = inst.get("InstanceId", "unknown")
+        stopped_at = _stopped_at(inst)
+        age = _age_days(stopped_at, now)
+        if older_than_days is not None and (age is None or age < older_than_days):
+            continue
+        since = f"stopped since {stopped_at:%Y-%m-%d}" if stopped_at else "stopped"
+
+        billed: List[str] = []
+        volumes: List[Dict[str, Any]] = []
+        cost = 0.0
+        for bdm in inst.get("BlockDeviceMappings", []) or []:
+            volume_id = (bdm.get("Ebs") or {}).get("VolumeId")
+            if not volume_id:
+                continue
+            vol = volumes_by_id.get(volume_id) or {}
+            size = vol.get("Size", 0)
+            vtype = vol.get("VolumeType", "gp2")
+            vol_cost = pricing.ebs_volume_monthly(region, vtype, size) if vol else 0.0
+            cost += vol_cost
+            volumes.append(
+                {"volume_id": volume_id, "size_gb": size, "volume_type": vtype,
+                 "monthly_cost": round(vol_cost, 2)}
+            )
+            billed.append(f"{volume_id} ({size} GiB {vtype})" if vol else volume_id)
+
+        eips = addresses_by_instance.get(instance_id, [])
+        for addr in eips:
+            billed.append(f"Elastic IP {addr.get('PublicIp')} (reported as eip_stopped_instance)")
+
+        detail: Dict[str, Any] = {
+            "instance_type": inst.get("InstanceType"),
+            "stopped_at": stopped_at.isoformat() if stopped_at else None,
+            "age_days": age,
+            "volumes": volumes,
+            "elastic_ips": [a.get("PublicIp") for a in eips],
+        }
+        name = _name_tag(inst.get("Tags"))
+        if name:
+            detail["name"] = name
+        reason = f"instance {since}; still billing: " + (", ".join(billed) or "nothing found")
+        findings.append(
+            Finding(
+                region=region,
+                kind="stopped_instance",
+                resource_id=instance_id,
+                monthly_cost=cost,
+                reason=reason,
+                detail=detail,
+            )
+        )
+        for addr in eips:
+            byoip = _is_byoip(addr)
+            eip_detail: Dict[str, Any] = {
+                "public_ip": addr.get("PublicIp"),
+                "instance_id": instance_id,
+                "association_id": addr.get("AssociationId"),
+                "age_days": age,
+            }
+            findings.append(
+                Finding(
+                    region=region,
+                    kind="eip_stopped_instance",
+                    resource_id=addr.get("AllocationId") or addr.get("PublicIp", "unknown"),
+                    monthly_cost=pricing.public_ipv4_monthly(region, byoip=byoip),
+                    reason=f"Elastic IP attached to instance {instance_id}, {since}",
+                    detail=eip_detail,
+                )
+            )
     return findings
 
 
@@ -304,13 +500,21 @@ def scan_region(
     now: Optional[datetime] = None,
     older_than_days: Optional[int] = None,
     errors: Optional[List[ScanError]] = None,
+    *,
+    services: Optional[Callable[[str], Any]] = None,
+    options: Optional[ScanOptions] = None,
 ) -> List[Finding]:
     """Run every orphan check against a single region's EC2 client.
 
     Pass `errors` to collect checks that had to be skipped instead of raising.
     A skipped check contributes no findings -- never a silent empty result.
+
+    `services(name)` returns this region's client for another service
+    (`elbv2`, `elb`, `cloudwatch`). Without it the load balancer and NAT
+    gateway checks, which need CloudWatch to tell idle from busy, do not run.
     """
     now = now or datetime.now(timezone.utc)
+    options = options or ScanOptions()
     findings: List[Finding] = []
     findings.extend(_run_check("eip", region, lambda: scan_eips(ec2, region), errors))
     findings.extend(
@@ -324,6 +528,39 @@ def scan_region(
             "snapshot", region, lambda: scan_snapshots(ec2, region, now, older_than_days), errors
         )
     )
+    findings.extend(
+        _run_check(
+            "stopped_instance",
+            region,
+            lambda: scan_stopped_instances(ec2, region, now, older_than_days),
+            errors,
+        )
+    )
+    findings.extend(
+        _run_check(
+            "ami", region, lambda: scan_amis(ec2, region, now, options.ami_unused_days), errors
+        )
+    )
+    if services is not None:
+        findings.extend(
+            _run_check(
+                "load_balancer",
+                region,
+                lambda: idle.scan_load_balancers(
+                    services("elbv2"), services("elb"), services("cloudwatch"), ec2,
+                    region, now, options,
+                ),
+                errors,
+            )
+        )
+        findings.extend(
+            _run_check(
+                "nat_gateway",
+                region,
+                lambda: idle.scan_nat_gateways(ec2, services("cloudwatch"), region, now, options),
+                errors,
+            )
+        )
     return findings
 
 
@@ -333,6 +570,9 @@ def scan_regions(
     now: Optional[datetime] = None,
     older_than_days: Optional[int] = None,
     errors: Optional[List[ScanError]] = None,
+    *,
+    service_factory: Optional[ServiceFactory] = None,
+    options: Optional[ScanOptions] = None,
 ) -> List[Finding]:
     """Scan multiple regions and aggregate every finding.
 
@@ -357,5 +597,12 @@ def scan_regions(
                 )
             )
             continue
-        all_findings.extend(scan_region(ec2, region, now, older_than_days, errors))
+        services = None
+        if service_factory is not None:
+            services = (lambda r: lambda name: service_factory(r, name))(region)
+        all_findings.extend(
+            scan_region(
+                ec2, region, now, older_than_days, errors, services=services, options=options
+            )
+        )
     return all_findings

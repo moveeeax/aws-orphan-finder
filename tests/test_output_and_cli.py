@@ -201,3 +201,160 @@ def test_cli_end_to_end_json(capsys, now):
     ids = {f["resource_id"] for f in data["findings"]}
     assert ids == {"eipalloc-1", "vol-1"}
     assert data["summary"]["total_monthly_cost"] > 0
+
+
+def _snapshot_chain(n, volume_id="vol-1", exists=False):
+    return [
+        Finding(
+            "us-east-1",
+            "snapshot",
+            f"snap-{i}",
+            0.5,
+            "retained",
+            {"volume_id": volume_id, "source_volume_exists": exists, "age_days": 100 + i},
+        )
+        for i in range(n)
+    ]
+
+
+def test_group_by_volume_collapses_a_chain_into_one_row():
+    findings = _snapshot_chain(40) + _sample_findings()
+    out = output.render("table", findings, summarize(findings), group_by="volume")
+    assert "snap-0" not in out
+    assert "40 snapshots, 100-139 days old" in out
+    assert "source volume deleted" in out
+    assert "retention that never prunes" in out
+    data = json.loads(output.render("json", findings, summarize(findings), group_by="volume"))
+    group = data["snapshot_groups"][0]
+    assert group["volume_id"] == "vol-1"
+    assert group["count"] == 40
+    assert group["monthly_cost"] == 20.0
+    assert group["possible_unpruned_retention"] is True
+    # Findings stay per snapshot: they are the deletion candidate list.
+    assert len([f for f in data["findings"] if f["kind"] == "snapshot"]) == 40
+
+
+def test_short_chain_is_not_called_unpruned():
+    findings = _snapshot_chain(3)
+    data = json.loads(output.render("json", findings, summarize(findings), group_by="volume"))
+    assert data["snapshot_groups"][0]["possible_unpruned_retention"] is False
+
+
+def test_render_html_escapes_values_and_marks_incomplete():
+    findings = [Finding("us-east-1", "eip", "<script>x</script>", 1.0, "a & b")]
+    errors = [ScanError("us-east-1", "snapshot", "DescribeImages", "AccessDenied", "nope")]
+    out = output.render("html", findings, summarize(findings), errors)
+    assert out.startswith("<!doctype html>")
+    assert "<script>" not in out
+    assert "&lt;script&gt;x&lt;/script&gt;" in out
+    assert "a &amp; b" in out
+    assert "Incomplete scan" in out
+
+
+def test_render_commands_are_all_commented_out():
+    findings = [
+        Finding("us-east-1", "eip", "eipalloc-1", 3.65, "idle"),
+        Finding("us-east-1", "snapshot", "snap-1", 1.0, "old"),
+        Finding("us-east-1", "nat_gateway", "nat-1", 36.5, "idle",
+                {"allocation_ids": ["eipalloc-n"]}),
+        Finding("us-east-1", "load_balancer", "web", 16.4, "idle",
+                {"type": "application", "arn": "arn:aws:elasticloadbalancing:x"}),
+        Finding("us-east-1", "load_balancer", "old-clb", 18.2, "idle", {"type": "classic"}),
+        Finding("us-east-1", "eip_stopped_instance", "eipalloc-2", 3.65, "stopped",
+                {"association_id": "eipassoc-2"}),
+    ]
+    out = output.render("commands", findings, summarize(findings))
+    lines = [l for l in out.splitlines() if l.strip()]
+    assert all(l.startswith("#") for l in lines)
+    assert "# aws ec2 release-address --region us-east-1 --allocation-id eipalloc-1" in out
+    assert "# aws ec2 delete-snapshot --region us-east-1 --snapshot-id snap-1" in out
+    assert "# aws ec2 delete-nat-gateway --region us-east-1 --nat-gateway-id nat-1" in out
+    assert "# aws ec2 release-address --region us-east-1 --allocation-id eipalloc-n" in out
+    assert "--load-balancer-arn arn:aws:elasticloadbalancing:x" in out
+    assert "# aws elb delete-load-balancer --region us-east-1 --load-balancer-name old-clb" in out
+    assert "disassociate-address --region us-east-1 --association-id eipassoc-2" in out
+
+
+def test_cli_public_ipv4_flag_adds_report(capsys):
+    fake = FakeEC2(
+        enis=[{"NetworkInterfaceId": "eni-1", "Attachment": {"InstanceId": "i-1"},
+               "PrivateIpAddresses": [{"Association": {"PublicIp": "4.4.4.4"}}]}],
+    )
+    rc = cli.main(
+        ["scan", "--regions", "us-east-1", "--output", "json", "--public-ipv4"],
+        client_factory=lambda r: fake,
+    )
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["public_ipv4"]["summary"]["by_owner"]["instance"]["count"] == 1
+    # In-use addresses are spend, not waste: they stay out of the findings.
+    assert data["findings"] == []
+
+
+def test_cli_without_public_ipv4_has_no_report_key(capsys):
+    rc = cli.main(
+        ["scan", "--regions", "us-east-1", "--output", "json"], client_factory=lambda r: FakeEC2()
+    )
+    assert rc == 0
+    assert "public_ipv4" not in json.loads(capsys.readouterr().out)
+
+
+def test_cli_passes_idle_thresholds_to_load_balancer_check(capsys, now):
+    from datetime import datetime, timezone
+    from tests.conftest import FakeCloudWatch, FakeELBv2, service_factory
+
+    created = datetime.now(timezone.utc) - timedelta(days=40)
+    lb = {
+        "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-1:1:loadbalancer/net/n/1",
+        "LoadBalancerName": "n",
+        "Type": "network",
+        "State": {"Code": "active"},
+        "CreatedTime": created,
+        "_target_groups": [{"_targets": ["healthy"]}],
+    }
+    cw = FakeCloudWatch({"net/n/1": 500})
+    factory = service_factory(elbv2=FakeELBv2([lb]), cloudwatch=cw)
+    argv = ["scan", "--regions", "us-east-1", "--output", "json"]
+
+    cli.main(argv, client_factory=lambda r: FakeEC2(), service_factory=factory)
+    assert json.loads(capsys.readouterr().out)["findings"] == []
+
+    cli.main(
+        argv + ["--lb-lookback", "30d", "--lb-min-traffic", "1000"],
+        client_factory=lambda r: FakeEC2(),
+        service_factory=factory,
+    )
+    data = json.loads(capsys.readouterr().out)
+    assert [f["kind"] for f in data["findings"]] == ["load_balancer"]
+    assert data["findings"][0]["detail"]["lookback_days"] == 30
+
+
+@pytest.mark.parametrize("bad", ["-1", "abc"])
+def test_min_traffic_rejects_bad_values(bad):
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.parse_positive_float(bad)
+
+
+def test_lookback_must_be_positive():
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.parse_lookback_days("0")
+
+
+def test_default_client_factory_builds_other_services(monkeypatch):
+    import boto3
+
+    services = []
+
+    class FakeSession:
+        def __init__(self, profile_name=None):
+            pass
+
+        def client(self, service, region_name=None, config=None):
+            services.append(service)
+            return service
+
+    monkeypatch.setattr(boto3, "Session", FakeSession)
+    factory = cli._default_client_factory(None)
+    assert factory("us-east-1", "elbv2") == "elbv2"
+    assert factory("us-east-1", "cloudwatch") == "cloudwatch"
+    assert services == ["elbv2", "cloudwatch"]

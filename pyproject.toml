@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aws-orphan-finder"
 version = "0.2.0"
-description = "Find orphaned AWS resources (unattached EIPs, EBS volumes, ENIs, stale snapshots) and estimate monthly waste."
+description = "Find orphaned and idle AWS resources (EIPs, EBS volumes, ENIs, snapshots, AMIs, stopped instances, load balancers, NAT gateways) and estimate monthly waste."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

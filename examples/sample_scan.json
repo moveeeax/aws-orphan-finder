@@ -4,7 +4,7 @@
       "region": "eu-west-1",
       "kind": "eip",
       "resource_id": "eipalloc-0a1b",
-      "monthly_cost": 3.83,
+      "monthly_cost": 3.65,
       "reason": "Elastic IP not associated with any instance or interface",
       "detail": {
         "public_ip": "52.10.1.2"
@@ -40,11 +40,82 @@
       "kind": "snapshot",
       "resource_id": "snap-0xy",
       "monthly_cost": 10.5,
-      "reason": "EBS snapshot retained, not referenced by any self-owned AMI (400 days old)",
+      "reason": "EBS snapshot retained, not referenced by any self-owned AMI; source volume vol-0gone no longer exists (400 days old)",
       "detail": {
         "size_gb": 200,
         "age_days": 400,
-        "description": ""
+        "description": "",
+        "volume_id": "vol-0gone",
+        "source_volume_exists": false
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "stopped_instance",
+      "resource_id": "i-0stopped",
+      "monthly_cost": 2.52,
+      "reason": "instance stopped since 2026-08-01; still billing: vol-0root (30 GiB gp3), Elastic IP 52.10.3.4 (reported as eip_stopped_instance)",
+      "detail": {
+        "instance_type": "m5.large",
+        "stopped_at": "2026-08-01T08:30:00+00:00",
+        "age_days": 102,
+        "volumes": [
+          {
+            "volume_id": "vol-0root",
+            "size_gb": 30,
+            "volume_type": "gp3",
+            "monthly_cost": 2.52
+          }
+        ],
+        "elastic_ips": [
+          "52.10.3.4"
+        ]
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "eip_stopped_instance",
+      "resource_id": "eipalloc-0c2d",
+      "monthly_cost": 3.65,
+      "reason": "Elastic IP attached to instance i-0stopped, stopped since 2026-08-01",
+      "detail": {
+        "public_ip": "52.10.3.4",
+        "instance_id": "i-0stopped",
+        "association_id": "eipassoc-0c2d",
+        "age_days": 102
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "ami",
+      "resource_id": "ami-0abc",
+      "monthly_cost": 26.25,
+      "reason": "AMI not launched in 619 days and not in any launch template",
+      "detail": {
+        "name": null,
+        "snapshot_ids": [
+          "snap-0ami"
+        ],
+        "size_gb": 500,
+        "last_launched": "2025-03-02T10:15:00+00:00",
+        "age_days": 619
+      }
+    },
+    {
+      "region": "eu-west-1",
+      "kind": "load_balancer",
+      "resource_id": "old-staging",
+      "monthly_cost": 17.25,
+      "reason": "Application Load Balancer idle: no registered targets",
+      "detail": {
+        "name": "old-staging",
+        "type": "application",
+        "arn": "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/old-staging/0f1e2d3c4b5a6978",
+        "age_days": 300,
+        "registered_targets": 0,
+        "serving_targets": 0,
+        "traffic": null,
+        "lookback_days": 14
       }
     },
     {
@@ -58,25 +129,46 @@
         "volume_type": "gp2",
         "age_days": 60
       }
+    },
+    {
+      "region": "us-east-1",
+      "kind": "nat_gateway",
+      "resource_id": "nat-0idle",
+      "monthly_cost": 36.5,
+      "reason": "NAT gateway idle: 0 packets out in 14 days (below 100); Elastic IP 3.80.0.1 included, release it after deleting",
+      "detail": {
+        "subnet_id": "subnet-9",
+        "vpc_id": "vpc-9",
+        "connectivity_type": "public",
+        "public_ips": [
+          "3.80.0.1"
+        ],
+        "allocation_ids": [
+          "eipalloc-0nat"
+        ],
+        "age_days": 200,
+        "traffic": 0.0,
+        "lookback_days": 14
+      }
     }
   ],
   "summary": {
-    "total_findings": 5,
-    "total_monthly_cost": 36.13,
+    "total_findings": 10,
+    "total_monthly_cost": 122.12,
     "by_region": {
       "eu-west-1": {
-        "count": 4,
-        "monthly_cost": 31.13
+        "count": 8,
+        "monthly_cost": 80.62
       },
       "us-east-1": {
-        "count": 1,
-        "monthly_cost": 5.0
+        "count": 2,
+        "monthly_cost": 41.5
       }
     },
     "by_kind": {
       "eip": {
         "count": 1,
-        "monthly_cost": 3.83
+        "monthly_cost": 3.65
       },
       "ebs_volume": {
         "count": 2,
@@ -89,6 +181,26 @@
       "snapshot": {
         "count": 1,
         "monthly_cost": 10.5
+      },
+      "stopped_instance": {
+        "count": 1,
+        "monthly_cost": 2.52
+      },
+      "eip_stopped_instance": {
+        "count": 1,
+        "monthly_cost": 3.65
+      },
+      "ami": {
+        "count": 1,
+        "monthly_cost": 26.25
+      },
+      "load_balancer": {
+        "count": 1,
+        "monthly_cost": 17.25
+      },
+      "nat_gateway": {
+        "count": 1,
+        "monthly_cost": 36.5
       }
     }
   },
